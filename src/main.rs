@@ -27,7 +27,17 @@ pub struct HandshakeMessage {
 }
 
 #[derive(Debug, Clone)]
-pub struct HandshakeProtocol;
+pub struct HandshakeProtocol {
+    pub app_public_key: Vec<u8>
+}
+
+impl HandshakeProtocol {
+    pub fn new(app_public_key: Vec<u8>) -> Self {
+        Self {
+            app_public_key,
+        }
+    }
+}
 
 impl UpgradeInfo for HandshakeProtocol {
     type Info = &'static str;
@@ -63,7 +73,7 @@ impl OutboundUpgrade<Stream> for HandshakeProtocol {
     fn upgrade_outbound(self, stream: Stream, _: Self::Info) -> Self::Future {
         Box::pin(async move {
             let app_message = HandshakeMessage { 
-                app_public_key: vec![] // This will be set from the handler's app_public_key
+                app_public_key: self.app_public_key // This will be set from the handler's app_public_key
             };
             let mut framed = Framed::new(stream, JsonCodec::<HandshakeMessage, HandshakeMessage>::new());
             framed.send(app_message).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -87,8 +97,8 @@ pub enum HandshakeEvent {
 impl HandshakeHandler {
     pub fn new(app_public_key: Vec<u8>) -> Self {
         Self {
+            outbound_substream: Some(SubstreamProtocol::new(HandshakeProtocol::new(app_public_key.clone()), ())),
             app_public_key,
-            outbound_substream: Some(SubstreamProtocol::new(HandshakeProtocol, ())),
             pending_events: Vec::new(),
         }
     }
@@ -103,7 +113,7 @@ impl ConnectionHandler for HandshakeHandler {
     type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, ()> {
-        SubstreamProtocol::new(HandshakeProtocol, ())
+        SubstreamProtocol::new(HandshakeProtocol::new(self.app_public_key.clone()), ())
     }
 
     fn poll(
