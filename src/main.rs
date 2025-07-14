@@ -266,8 +266,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let transport_kp = identity::Keypair::generate_ed25519();
     let app_kp = identity::Keypair::generate_ed25519();
     
-    println!("app_pk: {:?}", app_kp.public().encode_protobuf());
-    println!("transport_id: {:?}", transport_kp.public().to_peer_id());
+    println!("app_pk: {}", hex::encode(app_kp.public().encode_protobuf()));
+    println!("transport_id: {}", transport_kp.public().to_peer_id());
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(transport_kp)
         .with_tokio()
