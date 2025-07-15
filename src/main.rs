@@ -27,11 +27,11 @@ pub struct HandshakeMessage {
 }
 
 #[derive(Debug, Clone)]
-pub struct HandshakeProtocol {
+pub struct HandshakeUpgrade {
     pub app_public_key: Vec<u8>
 }
 
-impl HandshakeProtocol {
+impl HandshakeUpgrade {
     pub fn new(app_public_key: Vec<u8>) -> Self {
         Self {
             app_public_key,
@@ -39,7 +39,7 @@ impl HandshakeProtocol {
     }
 }
 
-impl UpgradeInfo for HandshakeProtocol {
+impl UpgradeInfo for HandshakeUpgrade {
     type Info = &'static str;
     type InfoIter = std::iter::Once<Self::Info>;
     
@@ -48,7 +48,7 @@ impl UpgradeInfo for HandshakeProtocol {
     }
 }
 
-impl InboundUpgrade<Stream> for HandshakeProtocol {
+impl InboundUpgrade<Stream> for HandshakeUpgrade {
     type Output = HandshakeMessage;
     type Error = io::Error;
     type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
@@ -65,7 +65,7 @@ impl InboundUpgrade<Stream> for HandshakeProtocol {
     }
 }
 
-impl OutboundUpgrade<Stream> for HandshakeProtocol {
+impl OutboundUpgrade<Stream> for HandshakeUpgrade {
     type Output = ();
     type Error = io::Error;
     type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
@@ -84,8 +84,8 @@ impl OutboundUpgrade<Stream> for HandshakeProtocol {
 
 pub struct HandshakeHandler {
     app_public_key: Vec<u8>,
-    outbound_substream: Option<SubstreamProtocol<HandshakeProtocol, ()>>,
-    pending_events: Vec<ConnectionHandlerEvent<HandshakeProtocol, (), HandshakeEvent>>,
+    outbound_substream: Option<SubstreamProtocol<HandshakeUpgrade, ()>>,
+    pending_events: Vec<ConnectionHandlerEvent<HandshakeUpgrade, (), HandshakeEvent>>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +97,7 @@ pub enum HandshakeEvent {
 impl HandshakeHandler {
     pub fn new(app_public_key: Vec<u8>) -> Self {
         Self {
-            outbound_substream: Some(SubstreamProtocol::new(HandshakeProtocol::new(app_public_key.clone()), ())),
+            outbound_substream: Some(SubstreamProtocol::new(HandshakeUpgrade::new(app_public_key.clone()), ())),
             app_public_key,
             pending_events: Vec::new(),
         }
@@ -107,13 +107,13 @@ impl HandshakeHandler {
 impl ConnectionHandler for HandshakeHandler {
     type FromBehaviour = ();
     type ToBehaviour = HandshakeEvent;
-    type InboundProtocol = HandshakeProtocol;
-    type OutboundProtocol = HandshakeProtocol;
+    type InboundProtocol = HandshakeUpgrade;
+    type OutboundProtocol = HandshakeUpgrade;
     type InboundOpenInfo = ();
     type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, ()> {
-        SubstreamProtocol::new(HandshakeProtocol::new(self.app_public_key.clone()), ())
+        SubstreamProtocol::new(HandshakeUpgrade::new(self.app_public_key.clone()), ())
     }
 
     fn poll(
