@@ -14,6 +14,7 @@ use libp2p::{
            SubstreamProtocol, derive_prelude::*},
     tcp, yamux, PeerId, Stream,
     core::upgrade::{InboundUpgrade, OutboundUpgrade, UpgradeInfo},
+    identity::ed25519::PublicKey,
 };
 use tokio::{io, io::AsyncBufReadExt, select};
 use serde::{Deserialize, Serialize};
@@ -27,19 +28,15 @@ pub struct HandshakeMessage {
 }
 
 #[derive(Debug, Clone)]
-pub struct SetupUpgrade {
-    pub app_public_key: Vec<u8>
-}
+pub struct InboundSetupUpgrade;
 
-impl SetupUpgrade {
-    pub fn new(app_public_key: Vec<u8>) -> Self {
-        Self {
-            app_public_key,
-        }
+impl InboundSetupUpgrade {
+    pub fn new() -> Self {
+        Self
     }
 }
 
-impl UpgradeInfo for SetupUpgrade {
+impl UpgradeInfo for InboundSetupUpgrade {
     type Info = &'static str;
     type InfoIter = std::iter::Once<Self::Info>;
     
@@ -48,7 +45,7 @@ impl UpgradeInfo for SetupUpgrade {
     }
 }
 
-impl InboundUpgrade<Stream> for SetupUpgrade {
+impl InboundUpgrade<Stream> for InboundSetupUpgrade {
     type Output = HandshakeMessage;
     type Error = io::Error;
     type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
@@ -65,7 +62,29 @@ impl InboundUpgrade<Stream> for SetupUpgrade {
     }
 }
 
-impl OutboundUpgrade<Stream> for SetupUpgrade {
+#[derive(Debug, Clone)]
+pub struct OutboundSetupUpgrade {
+    pub app_public_key: PublicKey
+}
+
+impl OutboundSetupUpgrade {
+    pub fn new(app_public_key: PublicKey) -> Self {
+        Self {
+            app_public_key,
+        }
+    }
+}
+
+impl UpgradeInfo for OutboundSetupUpgrade {
+    type Info = &'static str;
+    type InfoIter = std::iter::Once<Self::Info>;
+    
+    fn protocol_info(&self) -> Self::InfoIter {
+        std::iter::once("/handshake/1.0.0")
+    }
+}
+
+impl OutboundUpgrade<Stream> for OutboundSetupUpgrade {
     type Output = ();
     type Error = io::Error;
     type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
@@ -73,7 +92,7 @@ impl OutboundUpgrade<Stream> for SetupUpgrade {
     fn upgrade_outbound(self, stream: Stream, _: Self::Info) -> Self::Future {
         Box::pin(async move {
             let app_message = HandshakeMessage { 
-                app_public_key: self.app_public_key // This will be set from the handler's app_public_key
+                app_public_key: self.app_public_key.to_bytes().to_vec()
             };
             let mut framed = Framed::new(stream, JsonCodec::<HandshakeMessage, HandshakeMessage>::new());
             framed.send(app_message).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -83,22 +102,20 @@ impl OutboundUpgrade<Stream> for SetupUpgrade {
 }
 
 pub struct SetupHandler {
-    app_public_key: Vec<u8>,
-    outbound_substream: Option<SubstreamProtocol<SetupUpgrade, ()>>,
-    pending_events: Vec<ConnectionHandlerEvent<SetupUpgrade, (), SetupEvent>>,
+    outbound_substream: Option<SubstreamProtocol<OutboundSetupUpgrade, ()>>,
+    pending_events: Vec<ConnectionHandlerEvent<OutboundSetupUpgrade, (), SetupEvent>>,
 }
 
 #[derive(Debug, Clone)]
 pub enum SetupEvent {
-    AppKeyReceived { peer_id: PeerId, app_public_key: Vec<u8> },
+    AppKeyReceived { peer_id: PeerId, app_public_key: PublicKey },
     HandshakeComplete { peer_id: PeerId },
 }
 
 impl SetupHandler {
-    pub fn new(app_public_key: Vec<u8>) -> Self {
+    pub fn new(app_public_key: PublicKey) -> Self {
         Self {
-            outbound_substream: Some(SubstreamProtocol::new(SetupUpgrade::new(app_public_key.clone()), ())),
-            app_public_key,
+            outbound_substream: Some(SubstreamProtocol::new(OutboundSetupUpgrade::new(app_public_key), ())),
             pending_events: Vec::new(),
         }
     }
@@ -107,13 +124,13 @@ impl SetupHandler {
 impl ConnectionHandler for SetupHandler {
     type FromBehaviour = ();
     type ToBehaviour = SetupEvent;
-    type InboundProtocol = SetupUpgrade;
-    type OutboundProtocol = SetupUpgrade;
+    type InboundProtocol = InboundSetupUpgrade;
+    type OutboundProtocol = OutboundSetupUpgrade;
     type InboundOpenInfo = ();
     type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, ()> {
-        SubstreamProtocol::new(SetupUpgrade::new(self.app_public_key.clone()), ())
+        SubstreamProtocol::new(InboundSetupUpgrade::new(), ())
     }
 
     fn poll(
@@ -151,12 +168,14 @@ impl ConnectionHandler for SetupHandler {
         match event {
             libp2p::swarm::handler::ConnectionEvent::FullyNegotiatedInbound(inbound) => {
                 let handshake_msg = inbound.protocol;
-                self.pending_events.push(ConnectionHandlerEvent::NotifyBehaviour(
-                    SetupEvent::AppKeyReceived {
-                        peer_id: PeerId::random(),
-                        app_public_key: handshake_msg.app_public_key,
-                    },
-                ));
+                if let Ok(public_key) = PublicKey::try_from_bytes(&handshake_msg.app_public_key) {
+                    self.pending_events.push(ConnectionHandlerEvent::NotifyBehaviour(
+                        SetupEvent::AppKeyReceived {
+                            peer_id: PeerId::random(),
+                            app_public_key: public_key,
+                        },
+                    ));
+                }
             }
             libp2p::swarm::handler::ConnectionEvent::FullyNegotiatedOutbound(_outbound) => {
                 self.pending_events.push(ConnectionHandlerEvent::NotifyBehaviour(
@@ -182,13 +201,13 @@ impl ConnectionHandler for SetupHandler {
 
 #[derive(Debug)]
 pub struct SetupBehaviour {
-    app_public_key: Vec<u8>,
-    pub peer_app_keys: HashMap<PeerId, Vec<u8>>,
+    app_public_key: PublicKey,
+    pub peer_app_keys: HashMap<PeerId, PublicKey>,
     events: Vec<SetupEvent>,
 }
 
 impl SetupBehaviour {
-    pub fn new(app_public_key: Vec<u8>) -> Self {
+    pub fn new(app_public_key: PublicKey) -> Self {
         Self {
             app_public_key,
             peer_app_keys: HashMap::new(),
@@ -196,7 +215,7 @@ impl SetupBehaviour {
         }
     }
 
-    pub fn get_app_key(&self, peer_id: &PeerId) -> Option<&Vec<u8>> {
+    pub fn get_app_key(&self, peer_id: &PeerId) -> Option<&PublicKey> {
         self.peer_app_keys.get(peer_id)
     }
 }
@@ -276,7 +295,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let transport_kp = identity::Keypair::generate_ed25519();
     let app_kp = identity::Keypair::generate_ed25519();
     
-    println!("app_pk: {}", hex::encode(app_kp.public().encode_protobuf()));
+    println!("app_pk: {:?}", hex::encode(app_kp.public().try_into_ed25519().unwrap().to_bytes()));
     println!("transport_id: {}", transport_kp.public().to_peer_id());
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(transport_kp)
@@ -306,7 +325,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             // build a gossipsub network behaviour
             let gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Author(app_kp.public().to_peer_id()),
+                gossipsub::MessageAuthenticity::Author(key.public().to_peer_id()),
                 gossipsub_config,
             )?;
 
@@ -315,7 +334,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 key.public(),
             ));
             
-            let handshake = SetupBehaviour::new(app_kp.public().encode_protobuf());
+            let handshake = SetupBehaviour::new(app_kp.public().try_into_ed25519().unwrap());
             
             Ok(MyBehaviour { gossipsub, identify, handshake })
         })?
@@ -360,7 +379,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 } else if line == "/keys" {
                     println!("Transport Key => App Key mapping:");
                     for (peer_id, app_key) in swarm.behaviour().handshake.peer_app_keys.iter() {
-                        println!("  {peer_id} => {}", hex::encode(app_key));
+                        println!("  {peer_id} => {}", hex::encode(app_key.to_bytes()));
                     }
                 } else {
                     if let Err(e) = swarm
