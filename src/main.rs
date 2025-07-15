@@ -27,11 +27,11 @@ pub struct HandshakeMessage {
 }
 
 #[derive(Debug, Clone)]
-pub struct HandshakeUpgrade {
+pub struct SetupUpgrade {
     pub app_public_key: Vec<u8>
 }
 
-impl HandshakeUpgrade {
+impl SetupUpgrade {
     pub fn new(app_public_key: Vec<u8>) -> Self {
         Self {
             app_public_key,
@@ -39,7 +39,7 @@ impl HandshakeUpgrade {
     }
 }
 
-impl UpgradeInfo for HandshakeUpgrade {
+impl UpgradeInfo for SetupUpgrade {
     type Info = &'static str;
     type InfoIter = std::iter::Once<Self::Info>;
     
@@ -48,7 +48,7 @@ impl UpgradeInfo for HandshakeUpgrade {
     }
 }
 
-impl InboundUpgrade<Stream> for HandshakeUpgrade {
+impl InboundUpgrade<Stream> for SetupUpgrade {
     type Output = HandshakeMessage;
     type Error = io::Error;
     type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
@@ -65,7 +65,7 @@ impl InboundUpgrade<Stream> for HandshakeUpgrade {
     }
 }
 
-impl OutboundUpgrade<Stream> for HandshakeUpgrade {
+impl OutboundUpgrade<Stream> for SetupUpgrade {
     type Output = ();
     type Error = io::Error;
     type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
@@ -82,38 +82,38 @@ impl OutboundUpgrade<Stream> for HandshakeUpgrade {
     }
 }
 
-pub struct HandshakeHandler {
+pub struct SetupHandler {
     app_public_key: Vec<u8>,
-    outbound_substream: Option<SubstreamProtocol<HandshakeUpgrade, ()>>,
-    pending_events: Vec<ConnectionHandlerEvent<HandshakeUpgrade, (), HandshakeEvent>>,
+    outbound_substream: Option<SubstreamProtocol<SetupUpgrade, ()>>,
+    pending_events: Vec<ConnectionHandlerEvent<SetupUpgrade, (), SetupEvent>>,
 }
 
 #[derive(Debug, Clone)]
-pub enum HandshakeEvent {
+pub enum SetupEvent {
     AppKeyReceived { peer_id: PeerId, app_public_key: Vec<u8> },
     HandshakeComplete { peer_id: PeerId },
 }
 
-impl HandshakeHandler {
+impl SetupHandler {
     pub fn new(app_public_key: Vec<u8>) -> Self {
         Self {
-            outbound_substream: Some(SubstreamProtocol::new(HandshakeUpgrade::new(app_public_key.clone()), ())),
+            outbound_substream: Some(SubstreamProtocol::new(SetupUpgrade::new(app_public_key.clone()), ())),
             app_public_key,
             pending_events: Vec::new(),
         }
     }
 }
 
-impl ConnectionHandler for HandshakeHandler {
+impl ConnectionHandler for SetupHandler {
     type FromBehaviour = ();
-    type ToBehaviour = HandshakeEvent;
-    type InboundProtocol = HandshakeUpgrade;
-    type OutboundProtocol = HandshakeUpgrade;
+    type ToBehaviour = SetupEvent;
+    type InboundProtocol = SetupUpgrade;
+    type OutboundProtocol = SetupUpgrade;
     type InboundOpenInfo = ();
     type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, ()> {
-        SubstreamProtocol::new(HandshakeUpgrade::new(self.app_public_key.clone()), ())
+        SubstreamProtocol::new(SetupUpgrade::new(self.app_public_key.clone()), ())
     }
 
     fn poll(
@@ -152,7 +152,7 @@ impl ConnectionHandler for HandshakeHandler {
             libp2p::swarm::handler::ConnectionEvent::FullyNegotiatedInbound(inbound) => {
                 let handshake_msg = inbound.protocol;
                 self.pending_events.push(ConnectionHandlerEvent::NotifyBehaviour(
-                    HandshakeEvent::AppKeyReceived {
+                    SetupEvent::AppKeyReceived {
                         peer_id: PeerId::random(),
                         app_public_key: handshake_msg.app_public_key,
                     },
@@ -160,7 +160,7 @@ impl ConnectionHandler for HandshakeHandler {
             }
             libp2p::swarm::handler::ConnectionEvent::FullyNegotiatedOutbound(_outbound) => {
                 self.pending_events.push(ConnectionHandlerEvent::NotifyBehaviour(
-                    HandshakeEvent::HandshakeComplete {
+                    SetupEvent::HandshakeComplete {
                         peer_id: PeerId::random(),
                     },
                 ));
@@ -181,13 +181,13 @@ impl ConnectionHandler for HandshakeHandler {
 }
 
 #[derive(Debug)]
-pub struct HandshakeBehaviour {
+pub struct SetupBehaviour {
     app_public_key: Vec<u8>,
     pub peer_app_keys: HashMap<PeerId, Vec<u8>>,
-    events: Vec<HandshakeEvent>,
+    events: Vec<SetupEvent>,
 }
 
-impl HandshakeBehaviour {
+impl SetupBehaviour {
     pub fn new(app_public_key: Vec<u8>) -> Self {
         Self {
             app_public_key,
@@ -201,9 +201,9 @@ impl HandshakeBehaviour {
     }
 }
 
-impl NetworkBehaviour for HandshakeBehaviour {
-    type ConnectionHandler = HandshakeHandler;
-    type ToSwarm = HandshakeEvent;
+impl NetworkBehaviour for SetupBehaviour {
+    type ConnectionHandler = SetupHandler;
+    type ToSwarm = SetupEvent;
 
     fn handle_established_inbound_connection(
         &mut self,
@@ -212,7 +212,7 @@ impl NetworkBehaviour for HandshakeBehaviour {
         _: &libp2p::Multiaddr,
         _: &libp2p::Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        Ok(HandshakeHandler::new(self.app_public_key.clone()))
+        Ok(SetupHandler::new(self.app_public_key.clone()))
     }
 
     fn handle_established_outbound_connection(
@@ -223,7 +223,7 @@ impl NetworkBehaviour for HandshakeBehaviour {
         _: libp2p::core::Endpoint,
         _: PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        Ok(HandshakeHandler::new(self.app_public_key.clone()))
+        Ok(SetupHandler::new(self.app_public_key.clone()))
     }
 
     fn on_swarm_event(&mut self, _: libp2p::swarm::FromSwarm) {}
@@ -235,15 +235,15 @@ impl NetworkBehaviour for HandshakeBehaviour {
         event: libp2p::swarm::THandlerOutEvent<Self>,
     ) {
         match event {
-            HandshakeEvent::AppKeyReceived { app_public_key, .. } => {
+            SetupEvent::AppKeyReceived { app_public_key, .. } => {
                 self.peer_app_keys.insert(peer_id, app_public_key.clone());
-                self.events.push(HandshakeEvent::AppKeyReceived {
+                self.events.push(SetupEvent::AppKeyReceived {
                     peer_id,
                     app_public_key,
                 });
             }
-            HandshakeEvent::HandshakeComplete { .. } => {
-                self.events.push(HandshakeEvent::HandshakeComplete { peer_id });
+            SetupEvent::HandshakeComplete { .. } => {
+                self.events.push(SetupEvent::HandshakeComplete { peer_id });
             }
         }
     }
@@ -264,7 +264,7 @@ impl NetworkBehaviour for HandshakeBehaviour {
 struct MyBehaviour {
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
-    handshake: HandshakeBehaviour,
+    handshake: SetupBehaviour,
 }
 
 #[tokio::main]
@@ -315,7 +315,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 key.public(),
             ));
             
-            let handshake = HandshakeBehaviour::new(app_kp.public().encode_protobuf());
+            let handshake = SetupBehaviour::new(app_kp.public().encode_protobuf());
             
             Ok(MyBehaviour { gossipsub, identify, handshake })
         })?
@@ -385,14 +385,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 })) => {
                     println!("Identify sent to peer: {peer_id}");
                 },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(HandshakeEvent::AppKeyReceived { 
+                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupEvent::AppKeyReceived { 
                     peer_id, 
                     app_public_key: _ 
                 })) => {
                     println!("Handshake: Received app key from peer {peer_id}");
                     swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(HandshakeEvent::HandshakeComplete { 
+                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupEvent::HandshakeComplete { 
                     peer_id 
                 })) => {
                     println!("Handshake: Completed with peer {peer_id}");
