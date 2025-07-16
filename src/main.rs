@@ -1,62 +1,123 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     error::Error,
     hash::{Hash, Hasher},
-    time::Duration,
-    task::{Context, Poll},
     pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+    time::Duration,
 };
 
 use ::futures::stream::StreamExt;
-use libp2p::{
-    gossipsub, identity, identify, noise, 
-    swarm::{NetworkBehaviour, SwarmEvent, ConnectionHandler, ConnectionHandlerEvent, 
-           SubstreamProtocol, derive_prelude::*},
-    tcp, yamux, PeerId, Stream,
-    core::upgrade::{InboundUpgrade, OutboundUpgrade, UpgradeInfo},
-    identity::ed25519::PublicKey,
-};
-use tokio::{io, io::AsyncBufReadExt, select};
-use serde::{Deserialize, Serialize};
 use asynchronous_codec::{Framed, JsonCodec};
 use futures_util::SinkExt;
+use libp2p::{
+    PeerId, Stream,
+    core::upgrade::{InboundUpgrade, OutboundUpgrade, UpgradeInfo},
+    gossipsub, identify,
+    identity::{self, PublicKey, ed25519},
+    noise,
+    swarm::{
+        ConnectionHandler, ConnectionHandlerEvent, NetworkBehaviour, SubstreamProtocol, SwarmEvent,
+        derive_prelude::*, handler::ListenUpgradeError,
+    },
+    tcp, yamux,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{io, io::AsyncBufReadExt, select};
 use tracing_subscriber::EnvFilter;
+// use ed25519::PublicKey;
+
+// enum SignError {
+//     SignatureNotCorrespondsPublicKey,
+// }
+//
+// trait Signer {
+//     fn sign(
+//         data: &Vec<u8>,
+//         signer: &PublicKey, /* secret key is handled by the service lib */
+//     ) -> Result<Vec<u8>, SignError>;
+// }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeMessage {
-    pub app_public_key: Vec<u8>,
+    pub app_public_key: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
-pub struct InboundSetupUpgrade;
+pub struct InboundSetupUpgrade {
+    pub app_public_key: PublicKey,
+    pub tid_to_app_pk: Arc<Mutex<HashMap<PeerId, PublicKey>>>,
+    pub app_pk_banned: Arc<Mutex<HashSet<PublicKey>>>,
+}
 
 impl InboundSetupUpgrade {
-    pub fn new() -> Self {
-        Self
+    pub fn new(
+        app_public_key: PublicKey,
+        tid_to_app_pk: Arc<Mutex<HashMap<PeerId, PublicKey>>>,
+        app_pk_banned: Arc<Mutex<HashSet<PublicKey>>>,
+    ) -> Self {
+        Self {
+            app_public_key,
+            tid_to_app_pk,
+            app_pk_banned,
+        }
     }
 }
 
 impl UpgradeInfo for InboundSetupUpgrade {
     type Info = &'static str;
     type InfoIter = std::iter::Once<Self::Info>;
-    
+
     fn protocol_info(&self) -> Self::InfoIter {
         std::iter::once("/handshake/1.0.0")
     }
 }
 
+pub enum InboundError {
+    IoError(io::Error),
+    Banned(PublicKey),
+    AppPkDecodingError,
+}
+
 impl InboundUpgrade<Stream> for InboundSetupUpgrade {
     type Output = HandshakeMessage;
-    type Error = io::Error;
-    type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
+    type Error = InboundError;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
 
     fn upgrade_inbound(self, stream: Stream, _: Self::Info) -> Self::Future {
         Box::pin(async move {
-            let mut framed = Framed::new(stream, JsonCodec::<HandshakeMessage, HandshakeMessage>::new());
+            let mut framed = Framed::new(
+                stream,
+                JsonCodec::<HandshakeMessage, HandshakeMessage>::new(),
+            );
             match StreamExt::next(&mut framed).await {
-                Some(Ok(msg)) => Ok(msg),
-                Some(Err(e)) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-                None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stream closed")),
+                Some(Ok(msg)) => {
+                    println!("We got message: {:?}", msg);
+                    let app_pk_maybe: Result<ed25519::PublicKey, identity::DecodingError> =
+                        ed25519::PublicKey::try_from_bytes(&msg.app_public_key);
+                    if let Ok(app_pk_successfully_decoded) = app_pk_maybe {
+                        let app_pk = PublicKey::from(app_pk_successfully_decoded);
+                        if let Some(_) = self.app_pk_banned.lock().unwrap().get(&app_pk) {
+                            println!("And its banned {:?}", msg);
+                            Err(InboundError::Banned(app_pk))
+                        } else {
+                            println!("And its not banned {:?}", msg);
+                            Ok(msg)
+                        }
+                    } else {
+                        Err(InboundError::AppPkDecodingError)
+                    }
+                }
+                Some(Err(e)) => Err(InboundError::IoError(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    e,
+                ))),
+                None => Err(InboundError::IoError(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "stream closed",
+                ))),
             }
         })
     }
@@ -64,13 +125,21 @@ impl InboundUpgrade<Stream> for InboundSetupUpgrade {
 
 #[derive(Debug, Clone)]
 pub struct OutboundSetupUpgrade {
-    pub app_public_key: PublicKey
+    pub app_public_key: PublicKey,
+    pub tid_to_app_pk: Arc<Mutex<HashMap<PeerId, PublicKey>>>,
+    pub app_pk_banned: Arc<Mutex<HashSet<PublicKey>>>,
 }
 
 impl OutboundSetupUpgrade {
-    pub fn new(app_public_key: PublicKey) -> Self {
+    pub fn new(
+        app_public_key: PublicKey,
+        tid_to_app_pk: Arc<Mutex<HashMap<PeerId, PublicKey>>>,
+        app_pk_banned: Arc<Mutex<HashSet<PublicKey>>>,
+    ) -> Self {
         Self {
             app_public_key,
+            tid_to_app_pk,
+            app_pk_banned,
         }
     }
 }
@@ -78,7 +147,7 @@ impl OutboundSetupUpgrade {
 impl UpgradeInfo for OutboundSetupUpgrade {
     type Info = &'static str;
     type InfoIter = std::iter::Once<Self::Info>;
-    
+
     fn protocol_info(&self) -> Self::InfoIter {
         std::iter::once("/handshake/1.0.0")
     }
@@ -87,62 +156,113 @@ impl UpgradeInfo for OutboundSetupUpgrade {
 impl OutboundUpgrade<Stream> for OutboundSetupUpgrade {
     type Output = ();
     type Error = io::Error;
-    type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Output, Self::Error>> + Send>>;
 
     fn upgrade_outbound(self, stream: Stream, _: Self::Info) -> Self::Future {
         Box::pin(async move {
-            let app_message = HandshakeMessage { 
-                app_public_key: self.app_public_key.to_bytes().to_vec()
+            let app_message = HandshakeMessage {
+                app_public_key: self.app_public_key.try_into_ed25519().unwrap().to_bytes(),
             };
-            let mut framed = Framed::new(stream, JsonCodec::<HandshakeMessage, HandshakeMessage>::new());
-            framed.send(app_message).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            framed.close().await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            let mut framed = Framed::new(
+                stream,
+                JsonCodec::<HandshakeMessage, HandshakeMessage>::new(),
+            );
+            framed
+                .send(app_message)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            framed
+                .close()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
         })
     }
 }
 
 pub struct SetupHandler {
     outbound_substream: Option<SubstreamProtocol<OutboundSetupUpgrade, ()>>,
-    pending_events: Vec<ConnectionHandlerEvent<OutboundSetupUpgrade, (), SetupEvent>>,
+    pending_events: Vec<ConnectionHandlerEvent<OutboundSetupUpgrade, (), SetupHandlerEvent>>,
+    app_public_key: PublicKey,
+    tid_to_app_pk: Arc<Mutex<HashMap<PeerId, PublicKey>>>,
+    app_pk_banned: Arc<Mutex<HashSet<PublicKey>>>,
 }
 
 #[derive(Debug, Clone)]
-pub enum SetupEvent {
-    AppKeyReceived { peer_id: PeerId, app_public_key: PublicKey },
-    HandshakeComplete { peer_id: PeerId },
+pub enum SetupHandlerEvent {
+    AppKeyReceived { app_public_key: PublicKey },
+    HandshakeComplete,
+    ReceivedFromBannedPeer { app_public_key: PublicKey },
+    DecodingError,
+    IoError,
 }
 
+#[derive(Debug, Clone)]
+pub enum SetupBehaviourEvent {
+    AppKeyReceived {
+        peer_id: PeerId,
+        app_public_key: PublicKey,
+    },
+    HandshakeComplete {
+        peer_id: PeerId,
+    },
+    ReceivedFromBannedPeer {
+        peer_id: PeerId,
+        app_public_key: PublicKey,
+    },
+    DecodingError {
+        peer_id: PeerId,
+    },
+    IoError {
+        peer_id: PeerId,
+    },
+}
 impl SetupHandler {
-    pub fn new(app_public_key: PublicKey) -> Self {
+    pub fn new(
+        app_public_key: PublicKey,
+        tid_to_app_pk: Arc<Mutex<HashMap<PeerId, PublicKey>>>,
+        app_pk_banned: Arc<Mutex<HashSet<PublicKey>>>,
+    ) -> Self {
         Self {
-            outbound_substream: Some(SubstreamProtocol::new(OutboundSetupUpgrade::new(app_public_key), ())),
+            outbound_substream: Some(SubstreamProtocol::new(
+                OutboundSetupUpgrade::new(
+                    app_public_key.clone(),
+                    tid_to_app_pk.clone(),
+                    app_pk_banned.clone(),
+                ),
+                (),
+            )),
             pending_events: Vec::new(),
+            app_public_key,
+            tid_to_app_pk,
+            app_pk_banned,
         }
     }
 }
 
 impl ConnectionHandler for SetupHandler {
     type FromBehaviour = ();
-    type ToBehaviour = SetupEvent;
+    type ToBehaviour = SetupHandlerEvent;
     type InboundProtocol = InboundSetupUpgrade;
     type OutboundProtocol = OutboundSetupUpgrade;
     type InboundOpenInfo = ();
     type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, ()> {
-        SubstreamProtocol::new(InboundSetupUpgrade::new(), ())
+        SubstreamProtocol::new(
+            InboundSetupUpgrade::new(
+                self.app_public_key.clone(),
+                self.tid_to_app_pk.clone(),
+                self.app_pk_banned.clone(),
+            ),
+            (),
+        )
     }
 
     fn poll(
         &mut self,
         _: &mut Context<'_>,
-    ) -> Poll<
-        ConnectionHandlerEvent<
-            Self::OutboundProtocol,
-            (),
-            Self::ToBehaviour,
-        >,
-    > {
+    ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, (), Self::ToBehaviour>> {
         if let Some(event) = self.pending_events.pop() {
             return Poll::Ready(event);
         }
@@ -168,27 +288,47 @@ impl ConnectionHandler for SetupHandler {
         match event {
             libp2p::swarm::handler::ConnectionEvent::FullyNegotiatedInbound(inbound) => {
                 let handshake_msg = inbound.protocol;
-                if let Ok(public_key) = PublicKey::try_from_bytes(&handshake_msg.app_public_key) {
-                    self.pending_events.push(ConnectionHandlerEvent::NotifyBehaviour(
-                        SetupEvent::AppKeyReceived {
-                            peer_id: PeerId::random(),
+                let public_key = PublicKey::from(
+                    ed25519::PublicKey::try_from_bytes(&handshake_msg.app_public_key).unwrap(),
+                );
+                self.pending_events
+                    .push(ConnectionHandlerEvent::NotifyBehaviour(
+                        SetupHandlerEvent::AppKeyReceived {
                             app_public_key: public_key,
                         },
                     ));
-                }
             }
             libp2p::swarm::handler::ConnectionEvent::FullyNegotiatedOutbound(_outbound) => {
-                self.pending_events.push(ConnectionHandlerEvent::NotifyBehaviour(
-                    SetupEvent::HandshakeComplete {
-                        peer_id: PeerId::random(),
-                    },
-                ));
+                self.pending_events
+                    .push(ConnectionHandlerEvent::NotifyBehaviour(
+                        SetupHandlerEvent::HandshakeComplete {},
+                    ));
             }
             libp2p::swarm::handler::ConnectionEvent::DialUpgradeError(_) => {
                 // Handle dial upgrade error
             }
-            libp2p::swarm::handler::ConnectionEvent::ListenUpgradeError(_) => {
+            libp2p::swarm::handler::ConnectionEvent::ListenUpgradeError(ListenUpgradeError {
+                info: _info,
+                error,
+            }) => {
                 // Handle listen upgrade error
+                match error {
+                    InboundError::AppPkDecodingError => {
+                        self.pending_events
+                            .push(ConnectionHandlerEvent::NotifyBehaviour(
+                                SetupHandlerEvent::DecodingError,
+                            ));
+                    }
+                    InboundError::Banned(app_pk) => {
+                        self.pending_events
+                            .push(ConnectionHandlerEvent::NotifyBehaviour(
+                                SetupHandlerEvent::ReceivedFromBannedPeer {
+                                    app_public_key: app_pk,
+                                },
+                            ));
+                    }
+                    InboundError::IoError(_) => {}
+                }
             }
             _ => {}
         }
@@ -202,27 +342,33 @@ impl ConnectionHandler for SetupHandler {
 #[derive(Debug)]
 pub struct SetupBehaviour {
     app_public_key: PublicKey,
-    pub peer_app_keys: HashMap<PeerId, PublicKey>,
-    events: Vec<SetupEvent>,
+    tid_to_app_keys: Arc<Mutex<HashMap<PeerId, PublicKey>>>,
+    app_pk_banned: Arc<Mutex<HashSet<PublicKey>>>,
+    events: Vec<SetupBehaviourEvent>,
 }
 
 impl SetupBehaviour {
-    pub fn new(app_public_key: PublicKey) -> Self {
+    pub fn new(
+        app_public_key: PublicKey,
+        tid_to_app_pk: Arc<Mutex<HashMap<PeerId, PublicKey>>>,
+        app_pk_banned: Arc<Mutex<HashSet<PublicKey>>>,
+    ) -> Self {
         Self {
             app_public_key,
-            peer_app_keys: HashMap::new(),
+            tid_to_app_keys: tid_to_app_pk,
             events: Vec::new(),
+            app_pk_banned,
         }
     }
 
-    pub fn get_app_key(&self, peer_id: &PeerId) -> Option<&PublicKey> {
-        self.peer_app_keys.get(peer_id)
+    pub fn get_app_key(&self, peer_id: &PeerId) -> Option<PublicKey> {
+        self.tid_to_app_keys.lock().unwrap().get(peer_id).cloned()
     }
 }
 
 impl NetworkBehaviour for SetupBehaviour {
     type ConnectionHandler = SetupHandler;
-    type ToSwarm = SetupEvent;
+    type ToSwarm = SetupBehaviourEvent;
 
     fn handle_established_inbound_connection(
         &mut self,
@@ -231,7 +377,11 @@ impl NetworkBehaviour for SetupBehaviour {
         _: &libp2p::Multiaddr,
         _: &libp2p::Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        Ok(SetupHandler::new(self.app_public_key.clone()))
+        Ok(SetupHandler::new(
+            self.app_public_key.clone(),
+            self.tid_to_app_keys.clone(),
+            self.app_pk_banned.clone(),
+        ))
     }
 
     fn handle_established_outbound_connection(
@@ -242,7 +392,11 @@ impl NetworkBehaviour for SetupBehaviour {
         _: libp2p::core::Endpoint,
         _: PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        Ok(SetupHandler::new(self.app_public_key.clone()))
+        Ok(SetupHandler::new(
+            self.app_public_key.clone(),
+            self.tid_to_app_keys.clone(),
+            self.app_pk_banned.clone(),
+        ))
     }
 
     fn on_swarm_event(&mut self, _: libp2p::swarm::FromSwarm) {}
@@ -254,16 +408,33 @@ impl NetworkBehaviour for SetupBehaviour {
         event: libp2p::swarm::THandlerOutEvent<Self>,
     ) {
         match event {
-            SetupEvent::AppKeyReceived { app_public_key, .. } => {
-                self.peer_app_keys.insert(peer_id, app_public_key.clone());
-                self.events.push(SetupEvent::AppKeyReceived {
+            SetupHandlerEvent::AppKeyReceived { app_public_key, .. } => {
+                self.tid_to_app_keys
+                    .lock()
+                    .unwrap()
+                    .insert(peer_id, app_public_key.clone());
+                self.events.push(SetupBehaviourEvent::AppKeyReceived {
                     peer_id,
                     app_public_key,
                 });
             }
-            SetupEvent::HandshakeComplete { .. } => {
-                self.events.push(SetupEvent::HandshakeComplete { peer_id });
+            SetupHandlerEvent::HandshakeComplete { .. } => {
+                self.events
+                    .push(SetupBehaviourEvent::HandshakeComplete { peer_id });
             }
+            SetupHandlerEvent::ReceivedFromBannedPeer { app_public_key } => {
+                self.events
+                    .push(SetupBehaviourEvent::ReceivedFromBannedPeer {
+                        peer_id,
+                        app_public_key,
+                    })
+            }
+            SetupHandlerEvent::IoError => {
+                self.events.push(SetupBehaviourEvent::IoError { peer_id })
+            }
+            SetupHandlerEvent::DecodingError => self
+                .events
+                .push(SetupBehaviourEvent::DecodingError { peer_id }),
         }
     }
 
@@ -293,9 +464,52 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .try_init();
 
     let transport_kp = identity::Keypair::generate_ed25519();
-    let app_kp = identity::Keypair::generate_ed25519();
-    
-    println!("app_pk: {:?}", hex::encode(app_kp.public().try_into_ed25519().unwrap().to_bytes()));
+
+    let mut app_kp1 = Vec::from([
+        0xe6, 0x47, 0x24, 0x96, 0xaa, 0x6b, 0xa0, 0xb8, 0xe5, 0xa5, 0x42, 0xbc, 0x96, 0x3e, 0x1c,
+        0x29, 0x2e, 0xba, 0x32, 0x40, 0x46, 0x81, 0x10, 0x37, 0xb8, 0x19, 0x3a, 0xeb, 0x91, 0x27,
+        0x36, 0xa1,
+    ]);
+    let mut app_kp2 = Vec::from([
+        0xd1, 0xc0, 0x5e, 0x44, 0xc9, 0x72, 0xce, 0x14, 0xd7, 0xd9, 0x6c, 0x7a, 0x7d, 0xc1, 0x08,
+        0x71, 0x61, 0x5e, 0x07, 0x97, 0x29, 0x3c, 0x7a, 0x44, 0x1d, 0xc7, 0x1a, 0xaa, 0xfe, 0xb6,
+        0xd7, 0x45,
+    ]);
+    let _app_kp3 = Vec::from([
+        0x91, 0x33, 0xfd, 0xd7, 0xb3, 0xe4, 0x92, 0x83, 0x41, 0x9e, 0xa6, 0x89, 0x77, 0xc6, 0xbb,
+        0x47, 0xd8, 0x0f, 0xd0, 0xff, 0xfa, 0x04, 0x52, 0x4d, 0x52, 0xe3, 0x46, 0xe4, 0x20, 0x2f,
+        0x6d, 0xce,
+    ]);
+    let _app_kp4 = Vec::from([
+        0x83, 0x20, 0xbc, 0x1d, 0xd3, 0x21, 0x67, 0xdb, 0xc3, 0xf2, 0xd7, 0x7c, 0x1f, 0xf0, 0x6f,
+        0xad, 0x0c, 0xf7, 0x4f, 0x14, 0x0f, 0x9d, 0x07, 0xdb, 0xc7, 0x88, 0xdb, 0x6b, 0x07, 0x9f,
+        0x98, 0x9e,
+    ]);
+    let mut app_kp5 = Vec::from([
+        0xba, 0x35, 0x69, 0x3f, 0x23, 0x20, 0xd4, 0xc3, 0xda, 0xab, 0xb5, 0xe8, 0x41, 0x6e, 0xba,
+        0x46, 0x80, 0xea, 0xb8, 0x0f, 0xf8, 0x4a, 0x55, 0x9e, 0x65, 0xf1, 0x50, 0x20, 0x57, 0x97,
+        0x42, 0x90,
+    ]);
+
+    println!("app_kp creating, {}", app_kp1.len());
+    let app_kp = libp2p::identity::Keypair::ed25519_from_bytes(&mut app_kp1)?;
+
+    let tid_to_app_pk: Arc<Mutex<HashMap<PeerId, PublicKey>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    let app_pk_banned: Arc<Mutex<HashSet<PublicKey>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    println!("app_kp5 creating");
+    app_pk_banned
+        .lock()
+        .unwrap()
+        .insert(libp2p::identity::Keypair::ed25519_from_bytes(&mut app_kp5)?.public());
+
+    println!(
+        "app_pk: {:?}",
+        hex::encode(app_kp.public().try_into_ed25519().unwrap().to_bytes())
+    );
+
     println!("transport_id: {}", transport_kp.public().to_peer_id());
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(transport_kp)
@@ -329,14 +543,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 gossipsub_config,
             )?;
 
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/ipfs/0.1.0".into(),
-                key.public(),
-            ));
-            
-            let handshake = SetupBehaviour::new(app_kp.public().try_into_ed25519().unwrap());
-            
-            Ok(MyBehaviour { gossipsub, identify, handshake })
+            let identify =
+                identify::Behaviour::new(identify::Config::new("/ipfs/0.1.0".into(), key.public()));
+
+            let handshake = SetupBehaviour::new(app_kp.public(), tid_to_app_pk, app_pk_banned);
+
+            Ok(MyBehaviour {
+                gossipsub,
+                identify,
+                handshake,
+            })
         })?
         .build();
 
@@ -356,6 +572,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Commands:");
     println!("  /connect <multiaddr> - Connect to a peer");
     println!("  /keys - Show transport_kp => app_kp mapping for all peers");
+    println!("  /getconnectedpeers - Show getconnectedpeers");
     println!("  Any other text will be sent as a message");
 
     // Kick it off
@@ -378,9 +595,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 } else if line == "/keys" {
                     println!("Transport Key => App Key mapping:");
-                    for (peer_id, app_key) in swarm.behaviour().handshake.peer_app_keys.iter() {
-                        println!("  {peer_id} => {}", hex::encode(app_key.to_bytes()));
+                    for (peer_id, app_key) in swarm.behaviour().handshake.tid_to_app_keys.lock().unwrap().iter() {
+                        println!("  {peer_id} => {}", hex::encode(app_key.clone().try_into_ed25519()?.to_bytes()));
                     }
+                } else if line == "/getconnectedpeers" {
+                    println!("ConnectPeers:");
+                    println!("{:?}",swarm.connected_peers().collect::<Vec<_>>());
                 } else {
                     if let Err(e) = swarm
                         .behaviour_mut().gossipsub
@@ -398,23 +618,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("Identify received from peer: {peer_id}");
                     swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Sent { 
-                    peer_id, 
+                SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Sent {
+                    peer_id,
                     connection_id: _,
                 })) => {
                     println!("Identify sent to peer: {peer_id}");
                 },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupEvent::AppKeyReceived { 
-                    peer_id, 
-                    app_public_key: _ 
+                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::AppKeyReceived {
+                    peer_id,
+                    app_public_key: _
                 })) => {
                     println!("Handshake: Received app key from peer {peer_id}");
                     swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupEvent::HandshakeComplete { 
-                    peer_id 
+                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::HandshakeComplete {
+                    peer_id
                 })) => {
                     println!("Handshake: Completed with peer {peer_id}");
+                },
+                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::DecodingError {
+                    peer_id
+                })) => {
+                    println!("Setup: decoding of secret key error {peer_id}");
+                },
+                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::ReceivedFromBannedPeer {
+                    peer_id,
+                    app_public_key
+                })) => {
+                    println!("Setup: an attempt to connect from a banned user {peer_id} {app_public_key:?}");
+                },
+                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::IoError {
+                    peer_id,
+                })) => {
+                    println!("Setup: IoError {peer_id}");
                 },
                 SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source: peer_id,
