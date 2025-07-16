@@ -458,20 +458,20 @@ impl NetworkBehaviour for SetupBehaviour {
                 }
                 SetupBehaviourEvent::IoError {
                     peer_id,
-                    connection_id,
+                    connection_id: _,
                 }
                 | SetupBehaviourEvent::DecodingError {
                     peer_id,
-                    connection_id,
+                    connection_id: _,
                 }
                 | SetupBehaviourEvent::ReceivedFromBannedPeer {
                     peer_id,
                     app_public_key: _,
-                    connection_id,
+                    connection_id: _,
                 } => {
                     let to_swarm = libp2p::swarm::ToSwarm::CloseConnection {
                         peer_id,
-                        connection: libp2p::swarm::CloseConnection::One(connection_id),
+                        connection: libp2p::swarm::CloseConnection::All,
                     };
                     return Poll::Ready(to_swarm);
                 }
@@ -524,7 +524,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ]);
 
     println!("app_kp creating, {}", app_kp1.len());
-    let app_kp = libp2p::identity::Keypair::ed25519_from_bytes(&mut app_kp5)?;
+    let app_kp = libp2p::identity::Keypair::ed25519_from_bytes(&mut app_kp1)?;
 
     let tid_to_app_pk: Arc<Mutex<HashMap<PeerId, PublicKey>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -535,7 +535,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     app_pk_banned
         .lock()
         .unwrap()
-        .insert(libp2p::identity::Keypair::ed25519_from_bytes(&mut app_kp2)?.public());
+        .insert(libp2p::identity::Keypair::ed25519_from_bytes(&mut app_kp5)?.public());
 
     println!(
         "app_pk: {:?}",
