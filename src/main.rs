@@ -209,12 +209,15 @@ pub enum SetupBehaviourEvent {
     ReceivedFromBannedPeer {
         peer_id: PeerId,
         app_public_key: PublicKey,
+        connection_id: ConnectionId,
     },
     DecodingError {
         peer_id: PeerId,
+        connection_id: ConnectionId,
     },
     IoError {
         peer_id: PeerId,
+        connection_id: ConnectionId,
     },
 }
 impl SetupHandler {
@@ -404,7 +407,7 @@ impl NetworkBehaviour for SetupBehaviour {
     fn on_connection_handler_event(
         &mut self,
         peer_id: PeerId,
-        _: libp2p::swarm::ConnectionId,
+        connection_id: libp2p::swarm::ConnectionId,
         event: libp2p::swarm::THandlerOutEvent<Self>,
     ) {
         match event {
@@ -427,14 +430,19 @@ impl NetworkBehaviour for SetupBehaviour {
                     .push(SetupBehaviourEvent::ReceivedFromBannedPeer {
                         peer_id,
                         app_public_key,
+                        connection_id,
                     })
             }
-            SetupHandlerEvent::IoError => {
-                self.events.push(SetupBehaviourEvent::IoError { peer_id })
+            SetupHandlerEvent::IoError => self.events.push(SetupBehaviourEvent::IoError {
+                peer_id,
+                connection_id,
+            }),
+            SetupHandlerEvent::DecodingError => {
+                self.events.push(SetupBehaviourEvent::DecodingError {
+                    peer_id,
+                    connection_id,
+                })
             }
-            SetupHandlerEvent::DecodingError => self
-                .events
-                .push(SetupBehaviourEvent::DecodingError { peer_id }),
         }
     }
 
@@ -443,7 +451,31 @@ impl NetworkBehaviour for SetupBehaviour {
         _: &mut Context<'_>,
     ) -> Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
         if let Some(event) = self.events.pop() {
-            return Poll::Ready(libp2p::swarm::ToSwarm::GenerateEvent(event));
+            match event {
+                SetupBehaviourEvent::AppKeyReceived { .. }
+                | SetupBehaviourEvent::HandshakeComplete { .. } => {
+                    return Poll::Ready(libp2p::swarm::ToSwarm::GenerateEvent(event));
+                }
+                SetupBehaviourEvent::IoError {
+                    peer_id,
+                    connection_id,
+                }
+                | SetupBehaviourEvent::DecodingError {
+                    peer_id,
+                    connection_id,
+                }
+                | SetupBehaviourEvent::ReceivedFromBannedPeer {
+                    peer_id,
+                    app_public_key: _,
+                    connection_id,
+                } => {
+                    let to_swarm = libp2p::swarm::ToSwarm::CloseConnection {
+                        peer_id,
+                        connection: libp2p::swarm::CloseConnection::One(connection_id),
+                    };
+                    return Poll::Ready(to_swarm);
+                }
+            }
         }
         Poll::Pending
     }
@@ -492,7 +524,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ]);
 
     println!("app_kp creating, {}", app_kp1.len());
-    let app_kp = libp2p::identity::Keypair::ed25519_from_bytes(&mut app_kp1)?;
+    let app_kp = libp2p::identity::Keypair::ed25519_from_bytes(&mut app_kp5)?;
 
     let tid_to_app_pk: Arc<Mutex<HashMap<PeerId, PublicKey>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -503,7 +535,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     app_pk_banned
         .lock()
         .unwrap()
-        .insert(libp2p::identity::Keypair::ed25519_from_bytes(&mut app_kp5)?.public());
+        .insert(libp2p::identity::Keypair::ed25519_from_bytes(&mut app_kp2)?.public());
 
     println!(
         "app_pk: {:?}",
@@ -636,22 +668,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 })) => {
                     println!("Handshake: Completed with peer {peer_id}");
                 },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::DecodingError {
-                    peer_id
-                })) => {
-                    println!("Setup: decoding of secret key error {peer_id}");
-                },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::ReceivedFromBannedPeer {
-                    peer_id,
-                    app_public_key
-                })) => {
-                    println!("Setup: an attempt to connect from a banned user {peer_id} {app_public_key:?}");
-                },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::IoError {
-                    peer_id,
-                })) => {
-                    println!("Setup: IoError {peer_id}");
-                },
+                // SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::DecodingError {
+                //     peer_id
+                // })) => {
+                //     println!("Setup: decoding of secret key error {peer_id}");
+                // },
+                // SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::ReceivedFromBannedPeer {
+                //     peer_id,
+                //     app_public_key
+                // })) => {
+                //     println!("Setup: an attempt to connect from a banned user {peer_id} {app_public_key:?}");
+                // },
+                // SwarmEvent::Behaviour(MyBehaviourEvent::Handshake(SetupBehaviourEvent::IoError {
+                //     peer_id,
+                // })) => {
+                //     println!("Setup: IoError {peer_id}");
+                // },
                 SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source: peer_id,
                     message_id: id,
